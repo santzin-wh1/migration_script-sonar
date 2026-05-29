@@ -24,6 +24,9 @@ import (
 
 const migrator = "MDRV2"
 
+// copyFields is the partial-response field mask used on files.copy calls.
+const copyFields = "id,parents,name"
+
 // Options configures an APPLY run.
 type Options struct {
 	FoldersCSV    string
@@ -87,7 +90,8 @@ func Run(ctx context.Context, lg *slog.Logger, res *auth.Resolver, opt Options) 
 				continue
 			}
 			lg.Info("PAIR", "pair", eo+"->"+ed, "root", rootID, "items", len(rows))
-			if err := r.processPair(ctx, client, fc, ed, eo, rootID, rows, sleep); err != nil {
+			j := &pairJob{c: client, fc: fc, ed: ed, eo: eo, rootID: rootID, rows: rows, sleep: sleep}
+			if err := r.processPair(ctx, j); err != nil {
 				lg.Error("pair failed", "pair", eo+"->"+ed, "err", err)
 			}
 		}
@@ -117,31 +121,38 @@ type row struct {
 	src, name, mime, md5, mtime, path string
 }
 
-func (r *runner) processPair(ctx context.Context, c *driveclient.Client, fc *folderCache, ed, eo, rootID string, rows []row, sleep time.Duration) error {
-	// 1) folders first, serially, ordered by depth so parents exist first.
-	var folders []row
-	var files []row
-	for _, x := range rows {
-		if x.mime == driveclient.FolderMime {
-			folders = append(folders, x)
-		} else {
-			files = append(files, x)
-		}
-	}
-	sort.SliceStable(folders, func(i, j int) bool {
-		return depthOf(folders[i].path)+1 < depthOf(folders[j].path)+1
+// pairJob carries everything needed to migrate one origin→dest pair.
+type pairJob struct {
+	c      *driveclient.Client
+	fc     *folderCache
+	ed, eo string
+	rootID string
+	rows   []row
+	sleep  time.Duration
+}
+
+func (r *runner) processPair(ctx context.Context, j *pairJob) error {
+	folders, files := splitRows(j.rows)
+	r.ensureFolders(ctx, j, folders) // folders first, so file parents exist
+	return r.copyFiles(ctx, j, files)
+}
+
+// ensureFolders creates every folder serially, parents before children.
+func (r *runner) ensureFolders(ctx context.Context, j *pairJob, folders []row) {
+	sort.SliceStable(folders, func(a, b int) bool {
+		return depthOf(folders[a].path) < depthOf(folders[b].path)
 	})
 	for _, f := range folders {
 		full := join(f.path, f.name)
-		if _, err := fc.ensurePath(ctx, rootID, full); err != nil {
+		if _, err := j.fc.ensurePath(ctx, j.rootID, full); err != nil {
 			r.lg.Warn("ensure folder failed", "path", full, "err", err)
 		}
-		if sleep > 0 {
-			time.Sleep(sleep)
-		}
+		r.nap(j.sleep)
 	}
+}
 
-	// 2) files, concurrently (bounded). Per-file errors are logged, not fatal.
+// copyFiles copies files concurrently (bounded); per-file errors are logged.
+func (r *runner) copyFiles(ctx context.Context, j *pairJob, files []row) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(r.opt.Workers)
 	for _, f := range files {
@@ -150,86 +161,104 @@ func (r *runner) processPair(ctx context.Context, c *driveclient.Client, fc *fol
 			if gctx.Err() != nil {
 				return gctx.Err()
 			}
-			r.copyFile(gctx, c, fc, ed, eo, rootID, f)
-			if sleep > 0 {
-				time.Sleep(sleep)
-			}
+			r.copyFile(gctx, j, f)
+			r.nap(j.sleep)
 			return nil
 		})
 	}
 	return g.Wait()
 }
 
-func (r *runner) copyFile(ctx context.Context, c *driveclient.Client, fc *folderCache, ed, eo, rootID string, f row) {
+func (r *runner) nap(d time.Duration) {
+	if d > 0 {
+		time.Sleep(d)
+	}
+}
+
+func (r *runner) copyFile(ctx context.Context, j *pairJob, f row) {
 	if r.state.done(f.src) {
 		r.skipped.Add(1)
 		return
 	}
-	parent, err := fc.ensurePath(ctx, rootID, f.path)
+	parent, err := j.fc.ensurePath(ctx, j.rootID, f.path)
 	if err != nil {
 		r.lg.Warn("ensure path failed", "name", f.name, "err", err)
 		r.failed.Add(1)
 		return
 	}
-	eff := strings.ToLower(strings.TrimSpace(r.opt.UpdateChanged))
-	if eff == "" {
-		eff = "skip"
+	if existing := r.findExisting(ctx, j.c, parent, f.src); existing != nil && r.handleExisting(ctx, j, f, parent, existing) {
+		return
 	}
+	r.firstCopy(ctx, j, f, parent)
+}
 
-	existing := r.findExisting(ctx, c, parent, f.src)
-	if existing != nil {
-		changed := isChanged(f, existing)
-		if !changed || eff == "skip" {
-			r.lg.Info("SKIP", "name", f.name)
-			r.skipped.Add(1)
-			r.state.mark(f.src)
-			return
+// effUpdate returns the effective update mode ("" means full == skip).
+func (r *runner) effUpdate() string {
+	if eff := strings.ToLower(strings.TrimSpace(r.opt.UpdateChanged)); eff != "" {
+		return eff
+	}
+	return "skip"
+}
+
+// handleExisting deals with an already-migrated file; returns true if it took
+// final action (skip/replace/keep-both), false to fall through to a fresh copy.
+func (r *runner) handleExisting(ctx context.Context, j *pairJob, f row, parent string, existing *drive.File) bool {
+	eff := r.effUpdate()
+	if !isChanged(f, existing) || eff == "skip" {
+		r.lg.Info("SKIP", "name", f.name)
+		r.skipped.Add(1)
+		r.state.mark(f.src)
+		return true
+	}
+	switch eff {
+	case "replace":
+		return r.replaceFile(ctx, j, f, parent, existing)
+	case "keep-both":
+		return r.copyInto(ctx, j, f, parent, "KEEP-BOTH", &r.copied)
+	}
+	return false
+}
+
+func (r *runner) replaceFile(ctx context.Context, j *pairJob, f row, parent string, existing *drive.File) bool {
+	if !r.opt.DryRun {
+		if _, err := j.c.Copy(ctx, f.src, copyBody(f, parent, j.ed, j.eo), copyFields); err != nil {
+			r.lg.Warn("FAIL replace", "name", f.name, "reason", driveclient.Reason(err))
+			r.failed.Add(1)
+			return true
 		}
-		switch eff {
-		case "replace":
-			if !r.opt.DryRun {
-				if _, err := c.Copy(ctx, f.src, copyBody(f, parent, ed, eo), "id,parents,name"); err != nil {
-					r.lg.Warn("FAIL replace", "name", f.name, "reason", driveclient.Reason(err))
-					r.failed.Add(1)
-					return
-				}
-				if _, err := c.Update(ctx, existing.Id, &drive.File{Trashed: true}, "id,trashed", "Trashed"); err != nil {
-					r.lg.Warn("trash old failed", "name", f.name, "reason", driveclient.Reason(err))
-				}
-			}
-			r.lg.Info("REPLACE", "name", f.name)
-			r.replaced.Add(1)
-			r.state.mark(f.src)
-			return
-		case "keep-both":
-			if !r.opt.DryRun {
-				if _, err := c.Copy(ctx, f.src, copyBody(f, parent, ed, eo), "id,parents,name"); err != nil {
-					r.lg.Warn("FAIL keep-both", "name", f.name, "reason", driveclient.Reason(err))
-					r.failed.Add(1)
-					return
-				}
-			}
-			r.lg.Info("KEEP-BOTH", "name", f.name)
-			r.copied.Add(1)
-			r.state.mark(f.src)
-			return
+		if _, err := j.c.Update(ctx, existing.Id, &drive.File{Trashed: true}, "id,trashed", "Trashed"); err != nil {
+			r.lg.Warn("trash old failed", "name", f.name, "reason", driveclient.Reason(err))
 		}
 	}
+	r.lg.Info("REPLACE", "name", f.name)
+	r.replaced.Add(1)
+	r.state.mark(f.src)
+	return true
+}
 
-	// First migration of this src into this parent: copy.
+// copyInto copies f into parent under the given log label, bumping counter.
+func (r *runner) copyInto(ctx context.Context, j *pairJob, f row, parent, label string, counter *atomic.Int64) bool {
+	if !r.opt.DryRun {
+		if _, err := j.c.Copy(ctx, f.src, copyBody(f, parent, j.ed, j.eo), copyFields); err != nil {
+			r.lg.Warn("FAIL "+label, "name", f.name, "reason", driveclient.Reason(err))
+			r.failed.Add(1)
+			return true
+		}
+	}
+	r.lg.Info(label, "name", f.name)
+	counter.Add(1)
+	r.state.mark(f.src)
+	return true
+}
+
+// firstCopy handles the first migration of a src into a parent.
+func (r *runner) firstCopy(ctx context.Context, j *pairJob, f row, parent string) {
 	if r.opt.DryRun {
 		r.lg.Info("DRY COPY", "name", f.name)
 		r.copied.Add(1)
 		return
 	}
-	if _, err := c.Copy(ctx, f.src, copyBody(f, parent, ed, eo), "id,parents,name"); err != nil {
-		r.lg.Warn("FAIL copy", "name", f.name, "reason", driveclient.Reason(err))
-		r.failed.Add(1)
-		return
-	}
-	r.lg.Info("COPY", "name", f.name)
-	r.copied.Add(1)
-	r.state.mark(f.src)
+	r.copyInto(ctx, j, f, parent, "COPY", &r.copied)
 }
 
 func (r *runner) findExisting(ctx context.Context, c *driveclient.Client, parent, src string) *drive.File {
@@ -427,13 +456,7 @@ func loadFolders(opt Options) (map[[2]string]string, error) {
 		ed := strings.ToLower(strings.TrimSpace(col(rw, idx, "email_destino")))
 		eo := strings.ToLower(strings.TrimSpace(col(rw, idx, "email_origem")))
 		pid := strings.TrimSpace(col(rw, idx, "pasta_id_correta"))
-		if ed == "" || eo == "" || pid == "" {
-			continue
-		}
-		if opt.OnlyDest != "" && ed != strings.ToLower(opt.OnlyDest) {
-			continue
-		}
-		if opt.OnlySrc != "" && eo != strings.ToLower(opt.OnlySrc) {
+		if ed == "" || eo == "" || pid == "" || opt.skip(ed, eo) {
 			continue
 		}
 		key := [2]string{ed, eo}
@@ -466,13 +489,7 @@ func loadManifest(opt Options) (map[string]map[string][]row, error) {
 	for _, rw := range rows[1:] {
 		ed := strings.ToLower(strings.TrimSpace(col(rw, idx, "email_destino")))
 		eo := strings.ToLower(strings.TrimSpace(col(rw, idx, "email_origem")))
-		if ed == "" || eo == "" {
-			continue
-		}
-		if opt.OnlyDest != "" && ed != strings.ToLower(opt.OnlyDest) {
-			continue
-		}
-		if opt.OnlySrc != "" && eo != strings.ToLower(opt.OnlySrc) {
+		if ed == "" || eo == "" || opt.skip(ed, eo) {
 			continue
 		}
 		if out[ed] == nil {
@@ -503,6 +520,29 @@ func col(rw []string, idx map[string]int, name string) string {
 		return rw[i]
 	}
 	return ""
+}
+
+// splitRows partitions manifest rows into folders and files.
+func splitRows(rows []row) (folders, files []row) {
+	for _, x := range rows {
+		if x.mime == driveclient.FolderMime {
+			folders = append(folders, x)
+		} else {
+			files = append(files, x)
+		}
+	}
+	return folders, files
+}
+
+// skip reports whether a pair is filtered out by --only-dest/--only-src.
+func (opt Options) skip(ed, eo string) bool {
+	if opt.OnlyDest != "" && ed != strings.ToLower(opt.OnlyDest) {
+		return true
+	}
+	if opt.OnlySrc != "" && eo != strings.ToLower(opt.OnlySrc) {
+		return true
+	}
+	return false
 }
 
 func splitPath(p string) []string {

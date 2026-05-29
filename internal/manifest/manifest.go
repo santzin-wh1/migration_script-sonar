@@ -103,41 +103,66 @@ func Run(ctx context.Context, lg *slog.Logger, res *auth.Resolver, opt Options) 
 }
 
 func (r *runner) processPair(ctx context.Context, eo, ed string) error {
-	oSvc, err := r.res.GetDriveService(ctx, eo)
-	if err != nil {
-		return fmt.Errorf("origin drive: %w", err)
-	}
-	dSvc, err := r.res.GetDriveService(ctx, ed)
-	if err != nil {
-		return fmt.Errorf("dest drive: %w", err)
-	}
-	o := driveclient.New(oSvc, r.lg, r.opt.Attempts)
-	d := driveclient.New(dSvc, r.lg, r.opt.Attempts)
-
-	rootID, err := r.getOrCreateRoot(ctx, d, eo, ed)
+	o, d, err := r.openPair(ctx, eo, ed)
 	if err != nil {
 		return err
 	}
-	if r.usedRoots[rootID] {
-		// id collision across pairs: make a unique folder
-		if r.opt.DryRun {
-			rootID = fmt.Sprintf("DRY_COLLISION_%s_%s", eo, ed)
-		} else {
-			meta, err := d.Create(ctx, &drive.File{
-				Name:          fmt.Sprintf("%s (%s-%d)", eo, migrator, time.Now().Unix()),
-				MimeType:      driveclient.FolderMime,
-				AppProperties: markProps(eo, ed),
-			}, "id")
-			if err != nil {
-				return err
-			}
-			rootID = meta.Id
-		}
+	rootID, err := r.resolveRoot(ctx, d, eo, ed)
+	if err != nil {
+		return err
 	}
 	r.usedRoots[rootID] = true
 	_ = r.fw.Write([]string{ed, eo, rootID})
 
-	// Share origin's My Drive root children + Computers roots with the destination.
+	comps, err := listComputersRoots(ctx, o)
+	if err != nil {
+		return err
+	}
+	if err := r.shareAll(ctx, o, eo, ed, comps); err != nil {
+		return err
+	}
+	return r.buildManifest(ctx, o, eo, ed, comps)
+}
+
+// openPair returns wrapped Drive clients for the origin and destination.
+func (r *runner) openPair(ctx context.Context, eo, ed string) (origin, dest *driveclient.Client, err error) {
+	oSvc, err := r.res.GetDriveService(ctx, eo)
+	if err != nil {
+		return nil, nil, fmt.Errorf("origin drive: %w", err)
+	}
+	dSvc, err := r.res.GetDriveService(ctx, ed)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dest drive: %w", err)
+	}
+	return driveclient.New(oSvc, r.lg, r.opt.Attempts), driveclient.New(dSvc, r.lg, r.opt.Attempts), nil
+}
+
+// resolveRoot finds/creates the destination root, making a unique one on
+// cross-pair id collisions.
+func (r *runner) resolveRoot(ctx context.Context, d *driveclient.Client, eo, ed string) (string, error) {
+	rootID, err := r.getOrCreateRoot(ctx, d, eo, ed)
+	if err != nil {
+		return "", err
+	}
+	if !r.usedRoots[rootID] {
+		return rootID, nil
+	}
+	if r.opt.DryRun {
+		return fmt.Sprintf("DRY_COLLISION_%s_%s", eo, ed), nil
+	}
+	meta, err := d.Create(ctx, &drive.File{
+		Name:          fmt.Sprintf("%s (%s-%d)", eo, migrator, time.Now().Unix()),
+		MimeType:      driveclient.FolderMime,
+		AppProperties: markProps(eo, ed),
+	}, "id")
+	if err != nil {
+		return "", err
+	}
+	return meta.Id, nil
+}
+
+// shareAll shares the origin's My Drive root children + Computers roots.
+func (r *runner) shareAll(ctx context.Context, o *driveclient.Client, eo, ed string, comps []*drive.File) error {
 	if err := o.ListAll(ctx, "'root' in parents and trashed=false",
 		"nextPageToken, files(id,name,mimeType)", func(f *drive.File) error {
 			r.shareItem(ctx, o, f, eo, ed, "mydrive_root_child")
@@ -146,16 +171,15 @@ func (r *runner) processPair(ctx context.Context, eo, ed string) error {
 		}); err != nil {
 		return err
 	}
-	comps, err := listComputersRoots(ctx, o)
-	if err != nil {
-		return err
-	}
 	for _, c := range comps {
 		r.shareItem(ctx, o, c, eo, ed, "computers_root")
 		r.nap()
 	}
+	return nil
+}
 
-	// Build the manifest: folders (with structure) + loose files + Computers.
+// buildManifest writes folders (with structure) + loose files + Computers.
+func (r *runner) buildManifest(ctx context.Context, o *driveclient.Client, eo, ed string, comps []*drive.File) error {
 	if err := o.ListAll(ctx, "'root' in parents and trashed=false",
 		"nextPageToken, files(id,name,mimeType,md5Checksum,modifiedTime)", func(f *drive.File) error {
 			if f.MimeType == driveclient.FolderMime {
@@ -213,38 +237,58 @@ func (r *runner) shareItem(ctx context.Context, o *driveclient.Client, f *drive.
 }
 
 func (r *runner) getOrCreateRoot(ctx context.Context, d *driveclient.Client, eo, ed string) (string, error) {
-	key := [2]string{strings.ToLower(ed), strings.ToLower(eo)}
-	if fid, ok := r.reuse[key]; ok {
-		if meta, err := d.Get(ctx, fid, "id,mimeType,trashed"); err == nil &&
-			meta.MimeType == driveclient.FolderMime && !meta.Trashed {
-			if !r.opt.DryRun {
-				_ = r.adoptMark(ctx, d, fid, eo, ed)
-			}
-			r.lg.Info("root reuse", "pair", eo+"->"+ed, "root", fid)
-			return fid, nil
-		}
-		r.lg.Warn("reuse id invalid; falling back", "id", fid)
+	if fid := r.reuseRoot(ctx, d, eo, ed); fid != "" {
+		return fid, nil
 	}
-
-	if ex := r.findRoot(ctx, d, fmt.Sprintf(
+	markQ := fmt.Sprintf(
 		"'root' in parents and trashed=false and mimeType='%s' and appProperties has { key='src_email' and value='%s' }",
-		driveclient.FolderMime, driveclient.EscapeQuery(eo))); ex != nil {
-		if !r.opt.DryRun {
-			_ = r.adoptMark(ctx, d, ex.Id, eo, ed)
-		}
-		r.lg.Info("root adopt-by-mark", "pair", eo+"->"+ed, "root", ex.Id)
-		return ex.Id, nil
+		driveclient.FolderMime, driveclient.EscapeQuery(eo))
+	if fid := r.adoptRoot(ctx, d, markQ, eo, ed, "root adopt-by-mark"); fid != "" {
+		return fid, nil
 	}
-	if ex := r.findRoot(ctx, d, fmt.Sprintf(
+	nameQ := fmt.Sprintf(
 		"'root' in parents and trashed=false and mimeType='%s' and name='%s'",
-		driveclient.FolderMime, driveclient.EscapeQuery(eo))); ex != nil {
-		if !r.opt.DryRun {
-			_ = r.adoptMark(ctx, d, ex.Id, eo, ed)
-		}
-		r.lg.Info("root adopt-by-name", "pair", eo+"->"+ed, "root", ex.Id)
-		return ex.Id, nil
+		driveclient.FolderMime, driveclient.EscapeQuery(eo))
+	if fid := r.adoptRoot(ctx, d, nameQ, eo, ed, "root adopt-by-name"); fid != "" {
+		return fid, nil
 	}
+	return r.createRoot(ctx, d, eo, ed)
+}
 
+// reuseRoot validates and adopts a folder id from the reuse map; "" if absent
+// or invalid.
+func (r *runner) reuseRoot(ctx context.Context, d *driveclient.Client, eo, ed string) string {
+	fid, ok := r.reuse[[2]string{strings.ToLower(ed), strings.ToLower(eo)}]
+	if !ok {
+		return ""
+	}
+	meta, err := d.Get(ctx, fid, "id,mimeType,trashed")
+	if err != nil || meta.MimeType != driveclient.FolderMime || meta.Trashed {
+		r.lg.Warn("reuse id invalid; falling back", "id", fid)
+		return ""
+	}
+	if !r.opt.DryRun {
+		_ = r.adoptMark(ctx, d, fid, eo, ed)
+	}
+	r.lg.Info("root reuse", "pair", eo+"->"+ed, "root", fid)
+	return fid
+}
+
+// adoptRoot finds an existing root via query and adopts it; "" if none.
+func (r *runner) adoptRoot(ctx context.Context, d *driveclient.Client, query, eo, ed, logMsg string) string {
+	ex := r.findRoot(ctx, d, query)
+	if ex == nil {
+		return ""
+	}
+	if !r.opt.DryRun {
+		_ = r.adoptMark(ctx, d, ex.Id, eo, ed)
+	}
+	r.lg.Info(logMsg, "pair", eo+"->"+ed, "root", ex.Id)
+	return ex.Id
+}
+
+// createRoot creates a fresh root (or errors under must_exist).
+func (r *runner) createRoot(ctx context.Context, d *driveclient.Client, eo, ed string) (string, error) {
 	if r.opt.FolderMode == "must_exist" {
 		return "", fmt.Errorf("root folder %q missing in dest %s (folder-mode=must_exist)", eo, ed)
 	}
