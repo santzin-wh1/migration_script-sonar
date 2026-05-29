@@ -35,10 +35,10 @@ type Options struct {
 }
 
 type runner struct {
-	lg    *slog.Logger
-	res   *auth.Resolver
-	opt   Options
-	sleep time.Duration
+	lg        *slog.Logger
+	getClient func(ctx context.Context, email string) (driveAPI, error)
+	opt       Options
+	sleep     time.Duration
 
 	fw, mw, sf *csv.Writer
 	reuse      map[[2]string]string
@@ -49,11 +49,17 @@ type runner struct {
 func Run(ctx context.Context, lg *slog.Logger, res *auth.Resolver, opt Options) error {
 	r := &runner{
 		lg:        lg,
-		res:       res,
 		opt:       opt,
 		sleep:     time.Duration(max(opt.SleepMS, 0)) * time.Millisecond,
 		reuse:     map[[2]string]string{},
 		usedRoots: map[string]bool{},
+	}
+	r.getClient = func(ctx context.Context, email string) (driveAPI, error) {
+		svc, err := res.GetDriveService(ctx, email)
+		if err != nil {
+			return nil, err
+		}
+		return driveclient.New(svc, lg, opt.Attempts), nil
 	}
 	if err := r.loadReuse(); err != nil {
 		return err
@@ -102,6 +108,17 @@ func Run(ctx context.Context, lg *slog.Logger, res *auth.Resolver, opt Options) 
 	return nil
 }
 
+// driveAPI is the subset of *driveclient.Client used by the prepare stage,
+// extracted so tests can substitute a fake.
+type driveAPI interface {
+	List(ctx context.Context, query, fields, pageToken string) (*drive.FileList, error)
+	ListAll(ctx context.Context, query, fields string, yield func(*drive.File) error) error
+	Get(ctx context.Context, fileID, fields string) (*drive.File, error)
+	Create(ctx context.Context, f *drive.File, fields string) (*drive.File, error)
+	Update(ctx context.Context, fileID string, f *drive.File, fields string, forceSend ...string) (*drive.File, error)
+	Share(ctx context.Context, fileID, email, role string, notify bool) (*drive.Permission, error)
+}
+
 func (r *runner) processPair(ctx context.Context, eo, ed string) error {
 	o, d, err := r.openPair(ctx, eo, ed)
 	if err != nil {
@@ -124,22 +141,20 @@ func (r *runner) processPair(ctx context.Context, eo, ed string) error {
 	return r.buildManifest(ctx, o, eo, ed, comps)
 }
 
-// openPair returns wrapped Drive clients for the origin and destination.
-func (r *runner) openPair(ctx context.Context, eo, ed string) (origin, dest *driveclient.Client, err error) {
-	oSvc, err := r.res.GetDriveService(ctx, eo)
-	if err != nil {
+// openPair returns Drive clients for the origin and destination.
+func (r *runner) openPair(ctx context.Context, eo, ed string) (origin, dest driveAPI, err error) {
+	if origin, err = r.getClient(ctx, eo); err != nil {
 		return nil, nil, fmt.Errorf("origin drive: %w", err)
 	}
-	dSvc, err := r.res.GetDriveService(ctx, ed)
-	if err != nil {
+	if dest, err = r.getClient(ctx, ed); err != nil {
 		return nil, nil, fmt.Errorf("dest drive: %w", err)
 	}
-	return driveclient.New(oSvc, r.lg, r.opt.Attempts), driveclient.New(dSvc, r.lg, r.opt.Attempts), nil
+	return origin, dest, nil
 }
 
 // resolveRoot finds/creates the destination root, making a unique one on
 // cross-pair id collisions.
-func (r *runner) resolveRoot(ctx context.Context, d *driveclient.Client, eo, ed string) (string, error) {
+func (r *runner) resolveRoot(ctx context.Context, d driveAPI, eo, ed string) (string, error) {
 	rootID, err := r.getOrCreateRoot(ctx, d, eo, ed)
 	if err != nil {
 		return "", err
@@ -162,7 +177,7 @@ func (r *runner) resolveRoot(ctx context.Context, d *driveclient.Client, eo, ed 
 }
 
 // shareAll shares the origin's My Drive root children + Computers roots.
-func (r *runner) shareAll(ctx context.Context, o *driveclient.Client, eo, ed string, comps []*drive.File) error {
+func (r *runner) shareAll(ctx context.Context, o driveAPI, eo, ed string, comps []*drive.File) error {
 	if err := o.ListAll(ctx, "'root' in parents and trashed=false",
 		"nextPageToken, files(id,name,mimeType)", func(f *drive.File) error {
 			r.shareItem(ctx, o, f, eo, ed, "mydrive_root_child")
@@ -179,7 +194,7 @@ func (r *runner) shareAll(ctx context.Context, o *driveclient.Client, eo, ed str
 }
 
 // buildManifest writes folders (with structure) + loose files + Computers.
-func (r *runner) buildManifest(ctx context.Context, o *driveclient.Client, eo, ed string, comps []*drive.File) error {
+func (r *runner) buildManifest(ctx context.Context, o driveAPI, eo, ed string, comps []*drive.File) error {
 	if err := o.ListAll(ctx, "'root' in parents and trashed=false",
 		"nextPageToken, files(id,name,mimeType,md5Checksum,modifiedTime)", func(f *drive.File) error {
 			if f.MimeType == driveclient.FolderMime {
@@ -200,7 +215,7 @@ func (r *runner) buildManifest(ctx context.Context, o *driveclient.Client, eo, e
 }
 
 // walkFolder records folder at parentPath, then recurses its children.
-func (r *runner) walkFolder(ctx context.Context, o *driveclient.Client, folder *drive.File, parentPath, eo, ed string) error {
+func (r *runner) walkFolder(ctx context.Context, o driveAPI, folder *drive.File, parentPath, eo, ed string) error {
 	_ = r.mw.Write([]string{eo, ed, folder.Id, folder.Name, folder.MimeType, "", "", parentPath})
 	full := folder.Name
 	if parentPath != "" {
@@ -221,7 +236,7 @@ func (r *runner) writeFile(f *drive.File, path, eo, ed string) {
 	_ = r.mw.Write([]string{eo, ed, f.Id, f.Name, f.MimeType, f.Md5Checksum, f.ModifiedTime, path})
 }
 
-func (r *runner) shareItem(ctx context.Context, o *driveclient.Client, f *drive.File, eo, ed, where string) {
+func (r *runner) shareItem(ctx context.Context, o driveAPI, f *drive.File, eo, ed, where string) {
 	if r.opt.DryRun {
 		return
 	}
@@ -236,7 +251,7 @@ func (r *runner) shareItem(ctx context.Context, o *driveclient.Client, f *drive.
 	r.lg.Info("share ok", "where", where, "name", f.Name, "dest", ed)
 }
 
-func (r *runner) getOrCreateRoot(ctx context.Context, d *driveclient.Client, eo, ed string) (string, error) {
+func (r *runner) getOrCreateRoot(ctx context.Context, d driveAPI, eo, ed string) (string, error) {
 	if fid := r.reuseRoot(ctx, d, eo, ed); fid != "" {
 		return fid, nil
 	}
@@ -257,7 +272,7 @@ func (r *runner) getOrCreateRoot(ctx context.Context, d *driveclient.Client, eo,
 
 // reuseRoot validates and adopts a folder id from the reuse map; "" if absent
 // or invalid.
-func (r *runner) reuseRoot(ctx context.Context, d *driveclient.Client, eo, ed string) string {
+func (r *runner) reuseRoot(ctx context.Context, d driveAPI, eo, ed string) string {
 	fid, ok := r.reuse[[2]string{strings.ToLower(ed), strings.ToLower(eo)}]
 	if !ok {
 		return ""
@@ -275,7 +290,7 @@ func (r *runner) reuseRoot(ctx context.Context, d *driveclient.Client, eo, ed st
 }
 
 // adoptRoot finds an existing root via query and adopts it; "" if none.
-func (r *runner) adoptRoot(ctx context.Context, d *driveclient.Client, query, eo, ed, logMsg string) string {
+func (r *runner) adoptRoot(ctx context.Context, d driveAPI, query, eo, ed, logMsg string) string {
 	ex := r.findRoot(ctx, d, query)
 	if ex == nil {
 		return ""
@@ -288,7 +303,7 @@ func (r *runner) adoptRoot(ctx context.Context, d *driveclient.Client, query, eo
 }
 
 // createRoot creates a fresh root (or errors under must_exist).
-func (r *runner) createRoot(ctx context.Context, d *driveclient.Client, eo, ed string) (string, error) {
+func (r *runner) createRoot(ctx context.Context, d driveAPI, eo, ed string) (string, error) {
 	if r.opt.FolderMode == "must_exist" {
 		return "", fmt.Errorf("root folder %q missing in dest %s (folder-mode=must_exist)", eo, ed)
 	}
@@ -304,7 +319,7 @@ func (r *runner) createRoot(ctx context.Context, d *driveclient.Client, eo, ed s
 	return meta.Id, nil
 }
 
-func (r *runner) findRoot(ctx context.Context, d *driveclient.Client, query string) *drive.File {
+func (r *runner) findRoot(ctx context.Context, d driveAPI, query string) *drive.File {
 	res, err := d.List(ctx, query, "nextPageToken, files(id,name,appProperties)", "")
 	if err != nil || len(res.Files) == 0 {
 		return nil
@@ -312,7 +327,7 @@ func (r *runner) findRoot(ctx context.Context, d *driveclient.Client, query stri
 	return res.Files[0]
 }
 
-func (r *runner) adoptMark(ctx context.Context, d *driveclient.Client, fid, eo, ed string) error {
+func (r *runner) adoptMark(ctx context.Context, d driveAPI, fid, eo, ed string) error {
 	_, err := d.Update(ctx, fid, &drive.File{AppProperties: markProps(eo, ed)}, "id,appProperties")
 	return err
 }
@@ -353,7 +368,7 @@ func markProps(eo, ed string) map[string]string {
 	return map[string]string{"src_email": eo, "dest_email": ed, "migrator": migrator}
 }
 
-func listComputersRoots(ctx context.Context, o *driveclient.Client) ([]*drive.File, error) {
+func listComputersRoots(ctx context.Context, o driveAPI) ([]*drive.File, error) {
 	var out []*drive.File
 	err := o.ListAll(ctx,
 		fmt.Sprintf("trashed=false and mimeType='%s' and 'me' in owners and not 'root' in parents", driveclient.FolderMime),

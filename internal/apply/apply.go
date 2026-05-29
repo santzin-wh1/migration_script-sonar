@@ -71,28 +71,38 @@ func Run(ctx context.Context, lg *slog.Logger, res *auth.Resolver, opt Options) 
 	}
 	defer st.close()
 
-	r := &runner{lg: lg, res: res, opt: opt, state: st}
-	sleep := time.Duration(max(opt.SleepMS, 0)) * time.Millisecond
-
-	for ed, bySrc := range byDest {
-		dSvc, err := res.GetDriveService(ctx, ed)
+	r := &runner{lg: lg, opt: opt, state: st}
+	r.getClient = func(ctx context.Context, email string) (driveAPI, error) {
+		svc, err := res.GetDriveService(ctx, email)
 		if err != nil {
-			lg.Error("dest drive", "dest", ed, "err", err)
+			return nil, err
+		}
+		return driveclient.New(svc, lg, opt.Attempts), nil
+	}
+	return r.run(ctx, pair2root, byDest, start), nil
+}
+
+// run drives the migration over every dest→src pair, returning a summary.
+func (r *runner) run(ctx context.Context, pair2root map[[2]string]string, byDest map[string]map[string][]row, start time.Time) *Summary {
+	sleep := time.Duration(max(r.opt.SleepMS, 0)) * time.Millisecond
+	for ed, bySrc := range byDest {
+		client, err := r.getClient(ctx, ed)
+		if err != nil {
+			r.lg.Error("dest drive", "dest", ed, "err", err)
 			continue
 		}
-		client := driveclient.New(dSvc, lg, opt.Attempts)
-		fc := &folderCache{m: map[string]string{}, c: client, dry: opt.DryRun}
+		fc := &folderCache{m: map[string]string{}, c: client, dry: r.opt.DryRun}
 
 		for eo, rows := range bySrc {
 			rootID, ok := pair2root[[2]string{ed, eo}]
 			if !ok {
-				lg.Warn("skip pair: no root", "pair", eo+"->"+ed)
+				r.lg.Warn("skip pair: no root", "pair", eo+"->"+ed)
 				continue
 			}
-			lg.Info("PAIR", "pair", eo+"->"+ed, "root", rootID, "items", len(rows))
+			r.lg.Info("PAIR", "pair", eo+"->"+ed, "root", rootID, "items", len(rows))
 			j := &pairJob{c: client, fc: fc, ed: ed, eo: eo, rootID: rootID, rows: rows, sleep: sleep}
 			if err := r.processPair(ctx, j); err != nil {
-				lg.Error("pair failed", "pair", eo+"->"+ed, "err", err)
+				r.lg.Error("pair failed", "pair", eo+"->"+ed, "err", err)
 			}
 		}
 	}
@@ -104,15 +114,15 @@ func Run(ctx context.Context, lg *slog.Logger, res *auth.Resolver, opt Options) 
 		Failed:   r.failed.Load(),
 		Duration: time.Since(start).Round(time.Millisecond).String(),
 	}
-	lg.Info("APPLY done", "copied", sum.Copied, "replaced", sum.Replaced, "skipped", sum.Skipped, "failed", sum.Failed, "took", sum.Duration)
-	return sum, nil
+	r.lg.Info("APPLY done", "copied", sum.Copied, "replaced", sum.Replaced, "skipped", sum.Skipped, "failed", sum.Failed, "took", sum.Duration)
+	return sum
 }
 
 type runner struct {
-	lg    *slog.Logger
-	res   *auth.Resolver
-	opt   Options
-	state *state
+	lg        *slog.Logger
+	getClient func(ctx context.Context, email string) (driveAPI, error)
+	opt       Options
+	state     *state
 
 	copied, replaced, skipped, failed atomic.Int64
 }
@@ -121,9 +131,18 @@ type row struct {
 	src, name, mime, md5, mtime, path string
 }
 
+// driveAPI is the subset of *driveclient.Client used by the apply stage,
+// extracted so tests can substitute a fake.
+type driveAPI interface {
+	List(ctx context.Context, query, fields, pageToken string) (*drive.FileList, error)
+	Create(ctx context.Context, f *drive.File, fields string) (*drive.File, error)
+	Copy(ctx context.Context, srcID string, f *drive.File, fields string) (*drive.File, error)
+	Update(ctx context.Context, fileID string, f *drive.File, fields string, forceSend ...string) (*drive.File, error)
+}
+
 // pairJob carries everything needed to migrate one origin→dest pair.
 type pairJob struct {
-	c      *driveclient.Client
+	c      driveAPI
 	fc     *folderCache
 	ed, eo string
 	rootID string
@@ -261,7 +280,7 @@ func (r *runner) firstCopy(ctx context.Context, j *pairJob, f row, parent string
 	r.copyInto(ctx, j, f, parent, "COPY", &r.copied)
 }
 
-func (r *runner) findExisting(ctx context.Context, c *driveclient.Client, parent, src string) *drive.File {
+func (r *runner) findExisting(ctx context.Context, c driveAPI, parent, src string) *drive.File {
 	if r.opt.DryRun || strings.HasPrefix(parent, "DRY_") {
 		return nil
 	}
@@ -309,7 +328,7 @@ func isChanged(f row, existing *drive.File) bool {
 type folderCache struct {
 	mu  sync.Mutex
 	m   map[string]string
-	c   *driveclient.Client
+	c   driveAPI
 	dry bool
 }
 
