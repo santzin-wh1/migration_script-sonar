@@ -1,0 +1,17 @@
+# build artifacts
+/drivemig
+/bin/
+
+# run outputs (never commit credentials, tokens, manifests or logs)
+/logs/
+*.log
+out_folders.csv
+manifest.csv
+share_failures.csv
+state*.jsonl
+
+# credentials — must live in Secret Manager, never in git
+*client_secret*.json
+*service-account*.json
+*-sa-*.json
+token*.json
