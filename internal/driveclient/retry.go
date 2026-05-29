@@ -4,15 +4,27 @@ package driveclient
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
-	"math/rand"
 	"time"
 
 	"google.golang.org/api/googleapi"
 )
+
+// jitter returns a value in [0, 0.5) for backoff spreading. Not
+// security-sensitive (only de-syncs retry timing), but sourced from crypto/rand
+// to avoid seeding concerns and PRNG static-analysis warnings.
+func jitter() float64 {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return 0
+	}
+	return float64(binary.BigEndian.Uint64(b[:])>>11) / (1 << 53) * 0.5
+}
 
 // retryableStatus are HTTP status codes that always warrant a retry.
 var retryableStatus = map[int]bool{429: true, 500: true, 503: true}
@@ -97,7 +109,7 @@ func Do[T any](ctx context.Context, lg *slog.Logger, desc string, attempts int, 
 			lg.Warn("no-retry", "op", desc, "status", code, "reason", Reason(err))
 			return zero, err
 		}
-		sl := math.Min(delay*1.7+rand.Float64()*0.5, 20)
+		sl := math.Min(delay*1.7+jitter(), 20)
 		lg.Warn("backoff", "op", desc, "attempt", fmt.Sprintf("%d/%d", i, attempts), "sleep_s", fmt.Sprintf("%.2f", sl))
 		select {
 		case <-time.After(time.Duration(sl * float64(time.Second))):
