@@ -1,6 +1,7 @@
 # build artifacts
 /drivemig
 /bin/
+coverage.out
 
 # run outputs (never commit credentials, tokens, manifests or logs)
 /logs/
